@@ -1,0 +1,21 @@
+manifest:
+  defaults:
+    revision: main
+  remotes:
+    - name: zmkfirmware
+      url-base: https://github.com/zmkfirmware
+    - name: hrmt-lab
+      url-base: https://github.com/hrmt-lab
+  projects:
+    - name: zmk
+      remote: zmkfirmware
+      revision: main
+      import: app/west.yml
+    - name: zmk-raw-hid
+      remote: hrmt-lab
+      revision: custom/raw-hid-custom
+    - name: zmk-rawhid-app
+      remote: hrmt-lab
+      revision: develop
+  self:
+    path: config

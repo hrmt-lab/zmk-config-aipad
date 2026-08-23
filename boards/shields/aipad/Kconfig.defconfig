@@ -1,0 +1,31 @@
+if SHIELD_AIPAD
+
+config ZMK_KEYBOARD_NAME
+    default "aipad"
+
+config AIPAD_DISPLAY_SELFTEST
+    bool "Draw a boot self test on every ScreenKey"
+    default n
+    help
+      Bring-up aid. Without it, all four ScreenKeys are intentionally dark until
+      the host sends an AI client state, which is indistinguishable from broken
+      wiring. With it, every screen lights its backlight and draws a logo and a
+      full border right after init, independent of the host: even screens show
+      the Codex logo in a blue border and odd screens the Claude Code logo in a
+      green border, so neighbouring panels are always distinguishable and the
+      physical order of CS1..CS4 can be read off the board. A host update still
+      takes over normally. Turn this off once the hardware is confirmed.
+
+config AIPAD_ENCODER_PROBE
+    bool "Log the live level of the FPC pins the encoder could be on"
+    default n
+    help
+      Bring-up aid for a rotary encoder that does not respond. Every pin on the
+      24 way FPC is accounted for by the matrix, the panels or the backlight, so
+      the encoder has to be on one of the few pins left over. This samples those
+      pins and logs a line whenever one changes: turn the knob and the two that
+      toggle together are the encoder, without putting a meter on 0.5 mm pads.
+      Build with CONFIG_GPIO_HOGS=n as well, or the hog that parks the WS2812B
+      data line holds P0.05 low and hides an encoder channel wired there.
+
+endif

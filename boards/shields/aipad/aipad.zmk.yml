@@ -1,0 +1,9 @@
+file_format: "1"
+id: aipad
+name: aipad
+type: shield
+requires: [seeed_xiao]
+features:
+  - keys
+  - display
+  - encoder

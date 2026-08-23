@@ -1,0 +1,395 @@
+#include <zephyr/dt-bindings/gpio/gpio.h>
+#include <zephyr/dt-bindings/pwm/pwm.h>
+#include <zephyr/dt-bindings/mipi_dbi/mipi_dbi.h>
+#include <dt-bindings/zmk/matrix_transform.h>
+#include "aipad-layouts.dtsi"
+
+/* XIAO nRF52840 Plus pin assignment, taken from J1 on the schematic.
+ *
+ * The MCU sits on its own board and reaches the keyboard through a 24 pin FPC,
+ * so several of the nets below land on pins the plain XIAO does not break out.
+ * The seeed_xiao connector (&xiao_d) only maps D0..D10, so every reference in
+ * this file goes through &gpio0 / &gpio1 directly instead.
+ *
+ *   J1 pin  net     nRF pin  XIAO   use
+ *    4      CS-4    P1.15    D10    ScreenKey 4 chip select -> display slot 3
+ *    5      SCLK    P1.03    --     SPI clock, shared
+ *    6      CS-2    P1.14    D9     ScreenKey 2 chip select -> display slot 1
+ *    7      DC      P1.05    --     data/command, shared by all four panels
+ *    8      CS-1    P1.13    D8     ScreenKey 1 chip select -> display slot 0
+ *    9      CS-3    P1.07    --     ScreenKey 3 chip select -> display slot 2
+ *   10      MOSI    P1.12    D7     SPI data, shared
+ *   12      RST     P0.02    D0     panel reset, shared by all four panels
+ *   13      PWM     P0.15    --     backlight enable, shared (PAM2804 EN x4)
+ *   14      ROW0    P0.03    D1     matrix row 0 (the four ScreenKeys)
+ *   15      COL0    P0.19    --     matrix column 0
+ *   16      COL1    P0.28    D2     matrix column 1
+ *   17      ROW1    P1.01    --     matrix row 1
+ *   18      ROW2    P0.29    D3     matrix row 2
+ *   19      RE-A    P0.09    --     encoder A (NFC1 pad)
+ *   20      RE-B    P0.04    D4     encoder B
+ *   21      COL2    P0.10    --     matrix column 2 (NFC2 pad)
+ *   22      LED     P0.05    D5     WS2812B x4 data in - held low, see below
+ *   24      COL3    P1.11    D6     matrix column 3
+ *
+ * SCLK and CS-3 were originally read off the schematic the other way round
+ * (SCLK on P1.07, CS-3 on P1.03). The boot-time baseline in status_screen.c
+ * settled it: with every line pulled down, only a line carrying an external
+ * pull-up reads high, and the pull-ups (R1 / R3 / R9 / R11) sit on the four chip
+ * selects. P1.07 read high and P1.03 read low, so P1.07 is the chip select and
+ * P1.03 is the clock. With them swapped the panels never saw a clock, and
+ * because they are write-only the driver still reported a successful init.
+ *
+ * MISO is not wired: all four panels are write-only.
+ *
+ * Peripheral conflicts and how they are resolved:
+ *   - i2c1 defaults to P0.04/P0.05, which are the encoder B pin and the WS2812
+ *     data line here, so it is disabled below.
+ *   - uart0 defaults to P1.11 (TX) / P1.12 (RX), which are COL3 and MOSI here.
+ *     xiao_ble_zmk.dts already disables it (&xiao_serial), and the RPC for ZMK
+ *     Studio runs over USB CDC through the studio-rpc-usb-uart snippet, so
+ *     nothing has to be done here.
+ *   - spi2 defaults to P1.13/P1.14/P1.15, which are three of the chip selects.
+ *     The pinctrl block at the bottom moves SCK and MOSI onto P1.07 and P1.12.
+ *   - P0.09 and P0.10 are the NFC antenna pads; the &uicr override further down
+ *     turns them into GPIOs.
+ *   - The WS2812B chain on P0.05 has no LED driver yet. The pin is parked low
+ *     by a GPIO hog rather than left alone; see the &gpio0 node at the bottom.
+ */
+
+/ {
+    chosen {
+        /* Screen 0 goes through ZMK's display module, which only ever binds one
+         * chosen display. Screens 1..3 are registered with LVGL by
+         * src/screenkey_display.c instead. */
+        zephyr,display = &aipad_lcd0;
+        zmk,kscan = &kscan0;
+        zmk,physical-layout = &aipad_layout;
+    };
+
+    aipad_transform: aipad_transform {
+        compatible = "zmk,matrix-transform";
+        rows = <3>;
+        columns = <4>;
+        /* RC(2,3) is kept in the map even though the fitted encoder has no push
+         * switch. D12 on the PCB wires the encoder's S1/S2 pads into the matrix,
+         * so swapping in a push encoder later needs no devicetree change; the
+         * keymap binds &none there for now. */
+        map = <
+            RC(0,0) RC(0,1) RC(0,2) RC(0,3)
+            RC(1,0) RC(1,1) RC(1,2) RC(1,3)
+            RC(2,0) RC(2,1) RC(2,2) RC(2,3)
+        >;
+    };
+
+    kscan0: kscan {
+        compatible = "zmk,kscan-gpio-matrix";
+        wakeup-source;
+        diode-direction = "col2row";
+
+        col-gpios
+            = <&gpio0 19 GPIO_ACTIVE_HIGH>
+            , <&gpio0 28 GPIO_ACTIVE_HIGH>
+            , <&gpio0 10 GPIO_ACTIVE_HIGH>
+            , <&gpio1 11 GPIO_ACTIVE_HIGH>
+            ;
+
+        row-gpios
+            = <&gpio0  3 (GPIO_ACTIVE_HIGH | GPIO_PULL_DOWN)>
+            , <&gpio1  1 (GPIO_ACTIVE_HIGH | GPIO_PULL_DOWN)>
+            , <&gpio0 29 (GPIO_ACTIVE_HIGH | GPIO_PULL_DOWN)>
+            ;
+    };
+
+    /* Alps EC12E1220301: 12 detents and 12 pulses per rotation. The ZMK EC11
+     * driver counts every quadrature transition, so a full turn is 12 * 4 = 48
+     * steps and triggers-per-rotation = 12 makes one detent one key press.
+     * No GPIO_PULL_UP here, unlike the other encoders in this workspace. The
+     * board follows Alps' recommended filter: the 10K pull-up sits on the
+     * encoder terminal and a second 10K runs in series from there to the MCU,
+     * with 10nF to ground at the MCU end. That circuit needs a high impedance
+     * input. Switching on the nRF52840's internal pull-up (~13K) puts it in
+     * series with that 10K, so a closed contact only reaches
+     * 3.3V * 10 / (10 + 13) = 1.43V - above V_IL (0.3 * VDD = 0.99V), which
+     * means the pin never reads low and the encoder produces nothing at all.
+     * The other configs here get away with GPIO_PULL_UP because their encoders
+     * are wired straight to the pin with no series resistor. */
+    encoder: encoder {
+        compatible = "alps,ec11";
+        a-gpios = <&gpio0 9 GPIO_ACTIVE_HIGH>;
+        b-gpios = <&gpio0 4 GPIO_ACTIVE_HIGH>;
+        steps = <48>;
+        status = "okay";
+    };
+
+    sensors: sensors {
+        compatible = "zmk,keymap-sensors";
+        sensors = <&encoder>;
+        triggers-per-rotation = <12>;
+    };
+
+    /* All four ScreenKeys sit on the same SPI bus and share DC and RESET. Only
+     * the chip select differs: the child "reg" indexes the parent bus's
+     * cs-gpios list (see MIPI_DBI_SPI_CONFIG_DT in zephyr/drivers/mipi_dbi.h).
+     *
+     * RESET is deliberately declared on this first controller only. st7735r's
+     * init calls mipi_dbi_reset() on its own controller, and the reset line is
+     * physically shared, so any later controller carrying reset-gpios would
+     * hardware-reset the already-configured panels and leave them blank. With
+     * reset-gpios absent, mipi_dbi_reset() returns -ENOSYS there and st7735r
+     * falls back to the per-chip software reset (ST7735R_CMD_SW_RESET), which
+     * travels over that panel's own chip select and cannot disturb the others.
+     * Keep this node first: device init order follows devicetree order, and
+     * panel 0 must take the shared hardware reset before the rest are set up. */
+    aipad_mipi_dbi0: aipad_mipi_dbi0 {
+        compatible = "zephyr,mipi-dbi-spi";
+        spi-dev = <&spi2>;
+        dc-gpios = <&gpio1 5 GPIO_ACTIVE_HIGH>;
+        reset-gpios = <&gpio0 2 GPIO_ACTIVE_LOW>;
+        write-only;
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        aipad_lcd0: st7735s@0 {
+            compatible = "sitronix,st7735r";
+            mipi-max-frequency = <8000000>;
+            mipi-mode = "MIPI_DBI_MODE_SPI_4WIRE";
+            reg = <0>;
+            width = <128>;
+            height = <128>;
+            x-offset = <3>;
+            y-offset = <2>;
+            madctl = <0xa8>;
+            colmod = <0x05>;
+            inversion-on;
+            invctr = <0x03>;
+            vmctr1 = <0x0e>;
+            pwctr1 = [62 02 04];
+            pwctr2 = [c0];
+            pwctr3 = [0d 00];
+            pwctr4 = [8d 6a];
+            pwctr5 = [8d ee];
+            frmctr1 = [05 3a 3a];
+            frmctr2 = [05 3a 3a];
+            frmctr3 = [05 3a 3a 05 3a 3a];
+            gamctrp1 = [10 0e 02 03 0e 07 02 07 0a 12 27 37 00 0d 0e 10];
+            gamctrn1 = [10 0e 03 03 0f 06 02 08 0a 13 26 36 00 0d 0e 10];
+        };
+    };
+
+    /* Same SPI bus and same DC pin, no reset-gpios: see the comment above.
+     * The child reg still indexes &spi2's cs-gpios, so reg = <1> selects CS-2. */
+    aipad_mipi_dbi1: aipad_mipi_dbi1 {
+        compatible = "zephyr,mipi-dbi-spi";
+        spi-dev = <&spi2>;
+        dc-gpios = <&gpio1 5 GPIO_ACTIVE_HIGH>;
+        write-only;
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        aipad_lcd1: st7735s@1 {
+            compatible = "sitronix,st7735r";
+            mipi-max-frequency = <8000000>;
+            mipi-mode = "MIPI_DBI_MODE_SPI_4WIRE";
+            reg = <1>;
+            width = <128>;
+            height = <128>;
+            x-offset = <3>;
+            y-offset = <2>;
+            madctl = <0xa8>;
+            colmod = <0x05>;
+            inversion-on;
+            invctr = <0x03>;
+            vmctr1 = <0x0e>;
+            pwctr1 = [62 02 04];
+            pwctr2 = [c0];
+            pwctr3 = [0d 00];
+            pwctr4 = [8d 6a];
+            pwctr5 = [8d ee];
+            frmctr1 = [05 3a 3a];
+            frmctr2 = [05 3a 3a];
+            frmctr3 = [05 3a 3a 05 3a 3a];
+            gamctrp1 = [10 0e 02 03 0e 07 02 07 0a 12 27 37 00 0d 0e 10];
+            gamctrn1 = [10 0e 03 03 0f 06 02 08 0a 13 26 36 00 0d 0e 10];
+        };
+    };
+
+    aipad_mipi_dbi2: aipad_mipi_dbi2 {
+        compatible = "zephyr,mipi-dbi-spi";
+        spi-dev = <&spi2>;
+        dc-gpios = <&gpio1 5 GPIO_ACTIVE_HIGH>;
+        write-only;
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        aipad_lcd2: st7735s@2 {
+            compatible = "sitronix,st7735r";
+            mipi-max-frequency = <8000000>;
+            mipi-mode = "MIPI_DBI_MODE_SPI_4WIRE";
+            reg = <2>;
+            width = <128>;
+            height = <128>;
+            x-offset = <3>;
+            y-offset = <2>;
+            madctl = <0xa8>;
+            colmod = <0x05>;
+            inversion-on;
+            invctr = <0x03>;
+            vmctr1 = <0x0e>;
+            pwctr1 = [62 02 04];
+            pwctr2 = [c0];
+            pwctr3 = [0d 00];
+            pwctr4 = [8d 6a];
+            pwctr5 = [8d ee];
+            frmctr1 = [05 3a 3a];
+            frmctr2 = [05 3a 3a];
+            frmctr3 = [05 3a 3a 05 3a 3a];
+            gamctrp1 = [10 0e 02 03 0e 07 02 07 0a 12 27 37 00 0d 0e 10];
+            gamctrn1 = [10 0e 03 03 0f 06 02 08 0a 13 26 36 00 0d 0e 10];
+        };
+    };
+
+    aipad_mipi_dbi3: aipad_mipi_dbi3 {
+        compatible = "zephyr,mipi-dbi-spi";
+        spi-dev = <&spi2>;
+        dc-gpios = <&gpio1 5 GPIO_ACTIVE_HIGH>;
+        write-only;
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        aipad_lcd3: st7735s@3 {
+            compatible = "sitronix,st7735r";
+            mipi-max-frequency = <8000000>;
+            mipi-mode = "MIPI_DBI_MODE_SPI_4WIRE";
+            reg = <3>;
+            width = <128>;
+            height = <128>;
+            x-offset = <3>;
+            y-offset = <2>;
+            madctl = <0xa8>;
+            colmod = <0x05>;
+            inversion-on;
+            invctr = <0x03>;
+            vmctr1 = <0x0e>;
+            pwctr1 = [62 02 04];
+            pwctr2 = [c0];
+            pwctr3 = [0d 00];
+            pwctr4 = [8d 6a];
+            pwctr5 = [8d ee];
+            frmctr1 = [05 3a 3a];
+            frmctr2 = [05 3a 3a];
+            frmctr3 = [05 3a 3a 05 3a 3a];
+            gamctrp1 = [10 0e 02 03 0e 07 02 07 0a 12 27 37 00 0d 0e 10];
+            gamctrn1 = [10 0e 03 03 0f 06 02 08 0a 13 26 36 00 0d 0e 10];
+        };
+    };
+
+    /* CONFIG_RAWHID_APP_COMBO_RUNTIME=y replaces ZMK's devicetree Combo
+     * listener with the Keylink runtime engine, which requires /combos to be
+     * disabled here while its children stay in the keymap as defaults. */
+    combos {
+        status = "disabled";
+    };
+
+    /* One PWM channel drives the EN pin of all four PAM2804 backlight drivers,
+     * so the renderer keeps it on while any screen is showing something. */
+    aipad_pwm_leds: aipad_pwm_leds {
+        compatible = "pwm-leds";
+
+        aipad_backlight: aipad_backlight {
+            pwms = <&pwm1 0 PWM_MSEC(1) PWM_POLARITY_NORMAL>;
+        };
+    };
+};
+
+/* COL2 is P0.10 (NFC2) and the encoder A channel is P0.09 (NFC1). Without this
+ * the NFC peripheral keeps both pads, and the third column and one encoder
+ * channel are dead with no error anywhere. The UICR is written once, on the
+ * first boot after flashing, and only takes effect after a power cycle;
+ * switching back needs a UICR erase. CONFIG_NFCT_PINS_AS_GPIOS does the same
+ * thing but is deprecated in current Zephyr. xiao_ble_common.dtsi already sets
+ * gpio-as-nreset on this node; the two properties merge. */
+&uicr {
+    nfct-pins-as-gpios;
+};
+
+/* P0.04 (D4) and P0.05 (D5) are the XIAO's default I2C pins and are used here
+ * for the encoder B channel and the WS2812B data line. */
+&i2c1 {
+    status = "disabled";
+};
+
+/* P0.05 drives the four daisy-chained WS2812B, which nothing renders to yet.
+ * Left alone the pin comes out of reset as a disconnected input, so the first
+ * LED's DIN floats and can clock noise in as data - four LEDs latched to
+ * arbitrary colours is up to 240 mA through the XIAO's 3.3V regulator, which
+ * dissipates (5 - 3.3) x 0.24 = 0.4 W and shows up as a hot board. Holding the
+ * line low instead gives the chain a steady idle and keeps it dark.
+ *
+ * The hog runs at POST_KERNEL 41, right after the GPIO driver (40) and well
+ * before anything else touches the pin. Drop this node once the LEDs get a real
+ * driver for the planned AI-state colour indicator. */
+&gpio0 {
+    ws2812_din_idle {
+        gpio-hog;
+        gpios = <5 GPIO_ACTIVE_HIGH>;
+        output-low;
+    };
+};
+
+&spi2 {
+    status = "okay";
+    pinctrl-0 = <&aipad_spi2_default>;
+    pinctrl-1 = <&aipad_spi2_sleep>;
+    pinctrl-names = "default", "sleep";
+    /* Index n selects aipad_lcd<n>, which is display slot n. The physical
+     * left-to-right order of the ScreenKeys is assumed to follow CS-1..CS-4;
+     * confirm it with CONFIG_AIPAD_DISPLAY_SELFTEST and reorder this list if
+     * the board is wired the other way round. */
+    cs-gpios
+        = <&gpio1 13 GPIO_ACTIVE_LOW>
+        , <&gpio1 14 GPIO_ACTIVE_LOW>
+        , <&gpio1  7 GPIO_ACTIVE_LOW>
+        , <&gpio1 15 GPIO_ACTIVE_LOW>
+        ;
+};
+
+&pinctrl {
+    /* The board default puts SPI2 on P1.13/P1.14/P1.15; all three are chip
+     * selects here, so SCK and MOSI are remapped to P1.03 and P1.12. MISO is
+     * left unconnected. */
+    aipad_spi2_default: aipad_spi2_default {
+        group1 {
+            psels = <NRF_PSEL(SPIM_SCK, 1, 3)>,
+                    <NRF_PSEL(SPIM_MOSI, 1, 12)>;
+        };
+    };
+
+    aipad_spi2_sleep: aipad_spi2_sleep {
+        group1 {
+            psels = <NRF_PSEL(SPIM_SCK, 1, 3)>,
+                    <NRF_PSEL(SPIM_MOSI, 1, 12)>;
+            low-power-enable;
+        };
+    };
+
+    aipad_pwm1_default: aipad_pwm1_default {
+        group1 {
+            psels = <NRF_PSEL(PWM_OUT0, 0, 15)>;
+        };
+    };
+
+    aipad_pwm1_sleep: aipad_pwm1_sleep {
+        group1 {
+            psels = <NRF_PSEL(PWM_OUT0, 0, 15)>;
+            low-power-enable;
+        };
+    };
+};
+
+&pwm1 {
+    status = "okay";
+    pinctrl-0 = <&aipad_pwm1_default>;
+    pinctrl-1 = <&aipad_pwm1_sleep>;
+    pinctrl-names = "default", "sleep";
+};

@@ -1,0 +1,27 @@
+#include <physical_layouts.dtsi>
+
+/ {
+    aipad_layout: aipad_layout {
+        compatible = "zmk,physical-layout";
+        display-name = "aipad";
+        kscan = <&kscan0>;
+        transform = <&aipad_transform>;
+
+        /* Three rows of four. Row 0 is the four ScreenKeys, row 2 column 3 is
+         * the encoder position and never fires (see the overlay). */
+        keys
+            = <&key_physical_attrs 100 100   0   0 0 0 0>
+            , <&key_physical_attrs 100 100 100   0 0 0 0>
+            , <&key_physical_attrs 100 100 200   0 0 0 0>
+            , <&key_physical_attrs 100 100 300   0 0 0 0>
+            , <&key_physical_attrs 100 100   0 100 0 0 0>
+            , <&key_physical_attrs 100 100 100 100 0 0 0>
+            , <&key_physical_attrs 100 100 200 100 0 0 0>
+            , <&key_physical_attrs 100 100 300 100 0 0 0>
+            , <&key_physical_attrs 100 100   0 200 0 0 0>
+            , <&key_physical_attrs 100 100 100 200 0 0 0>
+            , <&key_physical_attrs 100 100 200 200 0 0 0>
+            , <&key_physical_attrs 100 100 300 200 0 0 0>
+            ;
+    };
+};

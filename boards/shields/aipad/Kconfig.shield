@@ -1,0 +1,2 @@
+config SHIELD_AIPAD
+    def_bool $(shields_list_contains,aipad)

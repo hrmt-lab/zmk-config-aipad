@@ -1,0 +1,122 @@
+#include <behaviors.dtsi>
+#include <behaviors/host_action.dtsi>
+#include <dt-bindings/zmk/keys.h>
+
+/ {
+    keymap {
+        compatible = "zmk,keymap";
+
+        default_layer {
+            display-name = "Default";
+            bindings = <
+                /* Row 0 sits under the four ScreenKeys. host_action 1 cycles
+                 * the AI session shown on one logical display slot; the value
+                 * is the slot number, so each key cycles the session on the
+                 * ScreenKey above it. The packet format is unchanged; the host
+                 * interprets the value. */
+                &host_action 1 0    &host_action 1 1    &host_action 1 2    &host_action 1 3
+                &kp A               &kp B               &kp C               &kp D
+                /* RC(2,3) is the encoder position. The fitted EC12E1220301 has
+                 * no push switch, so nothing ever reports there; the binding
+                 * exists only to keep the 3x4 map complete. */
+                &kp X               &kp Y               &bootloader         &none
+            >;
+
+            sensor-bindings = <&inc_dec_kp UP DOWN>;
+        };
+
+        /* Layers 1..7 exist so the host can switch into them and so ZMK Studio
+         * has something to edit: ZMK_KEYMAP_LAYERS_LEN comes from this keymap
+         * and Studio can never add a layer beyond it.
+         *
+         * There is no layer key on this board - all eleven keys are taken - so
+         * layers are activated by the host over APP_LAYER (0x30), which
+         * CONFIG_RAWHID_APP_LAYER_CONTROL=y handles.
+         *
+         * The ScreenKey row is repeated verbatim on every layer instead of
+         * being left transparent. Cycling the AI session on the screen you are
+         * looking at has to keep working whatever layer the host has pushed,
+         * and spelling it out means editing a lower layer in Studio cannot
+         * silently take it away. Everything else is &trans so an unconfigured
+         * layer behaves exactly like the layer below it.
+         *
+         * sensor-bindings is deliberately absent on these layers. &trans is a
+         * key behavior and has no #sensor-binding-cells, so it cannot be used
+         * for a sensor. A layer with no sensor binding leaves behavior_dev NULL
+         * and zmk_keymap_sensor_event() walks down to the next layer, which is
+         * the transparent behaviour we want: the encoder keeps falling through
+         * to the default layer's &inc_dec_kp. */
+
+        layer_1 {
+            display-name = "Layer1";
+            bindings = <
+                &host_action 1 0    &host_action 1 1    &host_action 1 2    &host_action 1 3
+                &trans              &trans              &trans              &trans
+                &trans              &trans              &trans              &trans
+            >;
+        };
+
+        layer_2 {
+            display-name = "Layer2";
+            bindings = <
+                &host_action 1 0    &host_action 1 1    &host_action 1 2    &host_action 1 3
+                &trans              &trans              &trans              &trans
+                &trans              &trans              &trans              &trans
+            >;
+        };
+
+        layer_3 {
+            display-name = "Layer3";
+            bindings = <
+                &host_action 1 0    &host_action 1 1    &host_action 1 2    &host_action 1 3
+                &trans              &trans              &trans              &trans
+                &trans              &trans              &trans              &trans
+            >;
+        };
+
+        layer_4 {
+            display-name = "Layer4";
+            bindings = <
+                &host_action 1 0    &host_action 1 1    &host_action 1 2    &host_action 1 3
+                &trans              &trans              &trans              &trans
+                &trans              &trans              &trans              &trans
+            >;
+        };
+
+        layer_5 {
+            display-name = "Layer5";
+            bindings = <
+                &host_action 1 0    &host_action 1 1    &host_action 1 2    &host_action 1 3
+                &trans              &trans              &trans              &trans
+                &trans              &trans              &trans              &trans
+            >;
+        };
+
+        layer_6 {
+            display-name = "Layer6";
+            bindings = <
+                &host_action 1 0    &host_action 1 1    &host_action 1 2    &host_action 1 3
+                &trans              &trans              &trans              &trans
+                &trans              &trans              &trans              &trans
+            >;
+        };
+
+        layer_7 {
+            display-name = "Layer7";
+            bindings = <
+                &host_action 1 0    &host_action 1 1    &host_action 1 2    &host_action 1 3
+                &trans              &trans              &trans              &trans
+                &trans              &trans              &trans              &trans
+            >;
+        };
+    };
+
+    /* Definitions live here as usual. The Keylink runtime Combo engine takes
+     * them as its read-only defaults; the overlay disables the node so ZMK's
+     * built-in Combo listener is not generated alongside it. There is a
+     * dedicated &bootloader key on this board, so no combo is defined by
+     * default; add children here if you want runtime-editable combos. */
+    combos {
+        compatible = "zmk,combos";
+    };
+};

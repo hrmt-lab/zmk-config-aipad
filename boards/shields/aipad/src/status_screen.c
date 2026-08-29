@@ -26,7 +26,6 @@ LOG_MODULE_REGISTER(screenkey_renderer, CONFIG_ZMK_LOG_LEVEL);
 #define BORDER_OBJECT_COUNT 4
 #define ANIMATION_PERIOD_MS 100
 #define BLINK_PERIOD_MS 1000
-#define COMPLETED_PERIOD_MS 30000
 #define PANEL_SIZE 128
 
 /* Partial render buffer for each screen this file drives. Screen 0 keeps using
@@ -538,7 +537,9 @@ static void screenkey_render(struct screenkey_screen *screen, uint8_t display_sl
         break;
     case SCREENKEY_RENDERER_COMPLETED:
         show_full_border(screen, lv_color_hex(0x22C55E), true);
-        start_timer(screen, COMPLETED_PERIOD_MS, true);
+        /* Shared with the LED hold in status_led.c so the border and the
+         * chain always go dark together. */
+        start_timer(screen, SCREENKEY_COMPLETED_HOLD_MS, true);
         break;
     case SCREENKEY_RENDERER_ERROR:
         screen->blink_visible = true;

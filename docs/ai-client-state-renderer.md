@@ -17,7 +17,7 @@ revision判定、heartbeat抑制、15秒Host timeoutはCoreの責務であり、
 この写像を担い、対応する画面が無いslotには`SCREENKEY_RENDERER_NO_SCREEN`を返す。
 そのeventは何も描画せずに捨てる。slotを画面0へ折り返さない。
 
-表示state（mode、animation frame、点滅位相、COMPLETEDの30秒timer、backlight要求）は
+表示state（mode、animation frame、点滅位相、COMPLETEDの15秒timer、backlight要求）は
 画面ごとに独立して持つ。あるslotの更新が他のslotのanimationを再開始させることはない。
 
 ただしbacklightは実機で4枚がPWM 1本（P0.15、PAM2804のEN×4）を共有するため、
@@ -65,7 +65,7 @@ DEVICE_HELLOで`CAP_AI_CLIENT_CLAUDE_CODE`（bit 12）を広告する。
 | `WAITING_APPROVAL` | 黄`#FACC15`の点滅枠 |
 | `WAITING_INPUT` | オレンジ`#F97316`の呼吸枠 |
 | `AVAILABLE` | ロゴ表示、枠なし |
-| `COMPLETED` | 既存の緑枠を30秒表示 |
+| `COMPLETED` | 既存の緑枠を15秒表示。共有LEDも同じ緑`#22C55E`を同じ15秒だけ点灯 |
 | `ERROR` | 既存の赤点滅枠 |
 | sessionなし／`NONE`／未知activity | 画面とbacklightをOFF |
 
@@ -100,7 +100,9 @@ Claude用assetは既に96×96のため縮小しない。`generate-claude-code-lo
 ## 変更しない表示契約
 
 - 青い移動線の長さ、形状、開始方向を変更しない。
-- 承認待ちの黄色点滅、ERRORの赤点滅、COMPLETEDの30秒timerを変更しない。
+- 承認待ちの黄色点滅、ERRORの赤点滅、COMPLETEDの保持時間を変更しない。
+  保持時間は`SCREENKEY_COMPLETED_HOLD_MS`（15000 ms）1定数で、緑枠と共有LEDの両方が読む。
+  片方だけ別の値にしない。
 - Host Linkへ色、frame、周期を追加しない。表示定数はRenderer内で管理する。
 - Host Linkへclient type固有の会話本文、session ID、hook event名を追加しない。
 - 1画面へ複数sessionを同時描画しない。1画面が表示するのは常に1 slot分だけである。

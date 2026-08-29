@@ -1,6 +1,7 @@
 #include <zephyr/dt-bindings/gpio/gpio.h>
 #include <zephyr/dt-bindings/pwm/pwm.h>
 #include <zephyr/dt-bindings/mipi_dbi/mipi_dbi.h>
+#include <zephyr/dt-bindings/led/led.h>
 #include <dt-bindings/zmk/matrix_transform.h>
 #include "aipad-layouts.dtsi"
 
@@ -29,7 +30,7 @@
  *   19      RE-A    P0.09    --     encoder A (NFC1 pad)
  *   20      RE-B    P0.04    D4     encoder B
  *   21      COL2    P0.10    --     matrix column 2 (NFC2 pad)
- *   22      LED     P0.05    D5     WS2812B x4 data in - held low, see below
+ *   22      LED     P0.05    D5     WS2812B x4 data in - SPIM3 MOSI, see &spi3
  *   24      COL3    P1.11    D6     matrix column 3
  *
  * SCLK and CS-3 were originally read off the schematic the other way round
@@ -53,8 +54,11 @@
  *     The pinctrl block at the bottom moves SCK and MOSI onto P1.07 and P1.12.
  *   - P0.09 and P0.10 are the NFC antenna pads; the &uicr override further down
  *     turns them into GPIOs.
- *   - The WS2812B chain on P0.05 has no LED driver yet. The pin is parked low
- *     by a GPIO hog rather than left alone; see the &gpio0 node at the bottom.
+ *   - The WS2812B chain on P0.05 is driven by spi3 in MOSI-only mode (see
+ *     &spi3 below). spi3's board-default pinctrl state reuses the QSPI flash
+ *     pins, so it is given its own state here that maps only MOSI to P0.05.
+ *     A GPIO hog still parks the pin low before spi3's driver takes it over
+ *     at boot, and after; see the &gpio0 node at the bottom for why.
  */
 
 / {
@@ -319,16 +323,29 @@
     status = "disabled";
 };
 
-/* P0.05 drives the four daisy-chained WS2812B, which nothing renders to yet.
- * Left alone the pin comes out of reset as a disconnected input, so the first
- * LED's DIN floats and can clock noise in as data - four LEDs latched to
- * arbitrary colours is up to 240 mA through the XIAO's 3.3V regulator, which
- * dissipates (5 - 3.3) x 0.24 = 0.4 W and shows up as a hot board. Holding the
- * line low instead gives the chain a steady idle and keeps it dark.
+/* P0.05 drives the four daisy-chained WS2812B. Left without a defined level,
+ * the first LED's DIN floats and can clock noise in as data - four LEDs
+ * latched to arbitrary colours is up to 240 mA through the XIAO's 3.3V
+ * regulator, dissipating (5 - 3.3) x 0.24 = 0.4 W and showing up as a hot
+ * board. Holding the line low gives the chain a defined idle and keeps it
+ * dark until spi3 starts driving it.
  *
- * The hog runs at POST_KERNEL 41, right after the GPIO driver (40) and well
- * before anything else touches the pin. Drop this node once the LEDs get a real
- * driver for the planned AI-state colour indicator. */
+ * Do NOT drop this node now that &spi3 / aipad_leds exist below. gpio_hogs_init()
+ * (zephyr/drivers/gpio/gpio_hogs.c:113) only calls gpio_pin_configure() - it
+ * has no pin-reservation mechanism - so pinctrl is free to reconfigure
+ * P0.05's PIN_CNF afterwards without conflict. But the hog runs at
+ * POST_KERNEL 41, right after the GPIO driver (40), while spi3's pinctrl
+ * only takes the pin at POST_KERNEL 50. In the gap between them, at
+ * POST_KERNEL 45, AIPAD_ENCODER_PROBE's screenkey_pin_walk() toggles the
+ * FPC's other signal pins for about 8 seconds; without this hog, P0.05 would
+ * sit as a floating input right next to those 0.5 mm traces for that whole
+ * window, free to pick up whatever they couple onto it. The hog keeps it
+ * driven low the entire time instead.
+ *
+ * It also future-proofs sleep: aipad_spi3_sleep's low-power-enable returns
+ * P0.05 to a fully high-impedance input once spi3 goes idle, so if
+ * CONFIG_PM or CONFIG_ZMK_SLEEP=y are enabled later, this hog - not the
+ * (then inactive) SPI pinctrl state - is what keeps the line from floating. */
 &gpio0 {
     ws2812_din_idle {
         gpio-hog;
@@ -354,6 +371,60 @@
         ;
 };
 
+/* WS2812B-V6 timing, driven over spi3 with no clock/MISO wired (MOSI-only,
+ * "spi-cs-less" style): each WS2812 bit is encoded as one 8-bit SPI frame at
+ * spi-max-frequency, where spi-one-frame / spi-zero-frame's count of leading
+ * high bits stands in for the WS2812's high pulse width.
+ *
+ * spi-max-frequency = <8000000>: the nRF SPIM only locks to 1/2/4/8/16/32
+ * MHz. get_nrf_spim_frequency() (zephyr/drivers/spi/spi_nrfx_spim.c:165)
+ * rounds a requested rate DOWN to the nearest one of those, silently.
+ * Asking for 6400000 would become 4 MHz, where one SPI bit is 250ns and
+ * spi-one-frame's 6 high bits (0xFC) would give a 1250ns T1H - over the
+ * WS2812B-V6's 1000ns ceiling. At 8 MHz one SPI bit is 125ns instead.
+ *
+ * spi-one-frame = <0xFC>: 6 of 8 bits high, i.e. 6 * 125ns = 750ns high.
+ * That sits mid-way inside the V6's T1H spec of 580ns-1us.
+ *
+ * spi-zero-frame = <0xC0>: 2 of 8 bits high, i.e. 2 * 125ns = 250ns high.
+ * That is inside the V6's T0H spec of 220-380ns.
+ *
+ * The resulting T1L (low time after a '1' bit) is 250ns, under the V6's
+ * nominal 580ns-1us T1L. That is fine: T1L is not one of the parameters
+ * WS2812B-V6 uses to tell a 0 bit from a 1 bit (only T0H/T1H are), and
+ * 250ns is nowhere near the ~280us RES/latch threshold either. Because the
+ * SPIM clock only takes discrete values, no single frequency puts both T1H
+ * and T1L inside spec at once - 8 MHz is the choice that keeps the
+ * bit-defining edges (T0H/T1H) correct.
+ *
+ * If either frame value is ever changed, keep bit 0 (the LSB) clear: SPI
+ * idles low between transfers, and a frame with a low LSB is what makes
+ * that idle level line up with a WS2812 low.
+ *
+ * reset-delay = <300>: WS2812B-V6 requires RES (latch/reset) > 280us
+ * between frames. 70, used for the plain WS2812B elsewhere in this
+ * workspace, is too short for the V6.
+ *
+ * color-mapping is GRB, per the WS2812B's byte order.
+ */
+&spi3 {
+    status = "okay";
+    pinctrl-0 = <&aipad_spi3_default>;
+    pinctrl-1 = <&aipad_spi3_sleep>;
+    pinctrl-names = "default", "sleep";
+
+    aipad_leds: ws2812@0 {
+        compatible = "worldsemi,ws2812-spi";
+        reg = <0>;
+        spi-max-frequency = <8000000>;
+        chain-length = <4>;
+        spi-one-frame  = <0xFC>;
+        spi-zero-frame = <0xC0>;
+        reset-delay = <300>;
+        color-mapping = <LED_COLOR_ID_GREEN LED_COLOR_ID_RED LED_COLOR_ID_BLUE>;
+    };
+};
+
 &pinctrl {
     /* The board default puts SPI2 on P1.13/P1.14/P1.15; all three are chip
      * selects here, so SCK and MOSI are remapped to P1.03 and P1.12. MISO is
@@ -369,6 +440,25 @@
         group1 {
             psels = <NRF_PSEL(SPIM_SCK, 1, 3)>,
                     <NRF_PSEL(SPIM_MOSI, 1, 12)>;
+            low-power-enable;
+        };
+    };
+
+    /* The board default spi3_default sits on P0.21 / P0.20 / P0.24, which are the
+     * QSPI flash pins (qspi_default in xiao_ble-pinctrl.dtsi uses the same three)
+     * and the p25q16h is enabled. Reusing that label would let SPI init take the
+     * flash's pins at POST_KERNEL 50, before QSPI ever gets them. spi3 therefore
+     * gets its own state here. Only MOSI is mapped: WS2812 needs no clock and no
+     * MISO, and every other pin on the FPC is spoken for. */
+    aipad_spi3_default: aipad_spi3_default {
+        group1 {
+            psels = <NRF_PSEL(SPIM_MOSI, 0, 5)>;
+        };
+    };
+
+    aipad_spi3_sleep: aipad_spi3_sleep {
+        group1 {
+            psels = <NRF_PSEL(SPIM_MOSI, 0, 5)>;
             low-power-enable;
         };
     };

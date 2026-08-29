@@ -5,6 +5,7 @@ if(CONFIG_SHIELD_AIPAD)
     src/encoder_probe.c
     src/screenkey_display.c
     src/screenkey_renderer_model.c
+    src/status_led.c
     src/status_screen.c
   )
 endif()

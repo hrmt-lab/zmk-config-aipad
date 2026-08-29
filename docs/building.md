@@ -89,6 +89,21 @@ Hostと無関係に起動直後から4画面へ描画し、パネル信号のピ
 `CONFIG_GPIO_HOGS=n`を忘れないでください。hogがP0.05をLowに固定したままだと、
 そこにエンコーダのチャンネルがあっても見えません。
 
+### LEDセルフテスト版
+
+起動直後にWS2812B-V6チェーンの先頭から赤→緑→青を流します（詳細は
+[bring-up.md](bring-up.md)参照）。
+
+```bash
+  -DCONFIG_AIPAD_STATUS_LED_SELFTEST=y \
+  -DCONFIG_ZMK_USB_LOGGING=y \
+  -DCONFIG_ZMK_LOGGING_MINIMAL=y -DCONFIG_ZMK_LOG_LEVEL_INF=y \
+  -DCONFIG_LOG_BUFFER_SIZE=16384
+```
+
+`CONFIG_AIPAD_DISPLAY_SELFTEST`とは独立したKconfigなので、12秒のバックライトbeaconや
+8秒のピンウォークを待たずにLEDだけを確認できます。
+
 ## ログの設定
 
 `CONFIG_ZMK_LOGGING_MINIMAL=y`と`CONFIG_ZMK_LOG_LEVEL_INF=y`はセットで指定します。
@@ -155,3 +170,18 @@ firmware build時に画像変換ツールは不要です。4画面とも同じ�
 | `boards/shields/aipad/aipad.overlay` | `zephyr,mipi-dbi-spi`ノードの数と`cs-gpios`の本数 |
 
 加えて`status_screen.c`の`extra_lcds[]`にパネルを足します。
+
+## LEDの色・明るさを変えるとき
+
+上限の明るさ（既定40%）は`src/screenkey_renderer_model.h`の`SCREENKEY_LED_MAX_LEVEL`
+1定数で決まります。呼吸表示（入力待ち）はこの値を上限に10%〜40%で明滅するので、
+ここを変えるとブレークもピークも一緒に動きます。
+
+各状態の色そのものは`src/screenkey_renderer_model.c`の`screenkey_led_color_for()`内、
+`SCREENKEY_LED_WAITING_APPROVAL` / `SCREENKEY_LED_WAITING_INPUT` / `SCREENKEY_LED_ERROR` /
+`SCREENKEY_LED_COMPLETED`の各caseにあります。完了だけは点滅も呼吸もせず、上限の明るさで
+点灯し続けます。
+
+完了の点灯時間は`src/screenkey_renderer_model.h`の`SCREENKEY_COMPLETED_HOLD_MS`（既定15秒）で、
+ScreenKeyの緑枠とWS2812Bが同じ値を読みます。ここを変えると両方が一緒に動くので、
+片方だけ変えたい場合以外は定数を書き換えるだけで済みます。

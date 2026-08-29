@@ -122,3 +122,133 @@ size_t screenkey_renderer_working_segments(
 
     return count;
 }
+
+static uint8_t scale8(uint8_t value, uint8_t level) {
+    return (uint8_t)(((uint16_t)value * level) / 255U);
+}
+
+enum screenkey_led_indication
+screenkey_led_indication_for_modes(const enum screenkey_renderer_mode *modes, size_t count) {
+    bool saw_waiting_approval = false;
+    bool saw_waiting_input = false;
+    bool saw_error = false;
+    bool saw_completed = false;
+
+    /* Scan the whole array before deciding anything: returning early on the
+     * first match seen would make the result depend on array order, and the
+     * caller cannot guarantee any particular order across screens. */
+    for (size_t index = 0; index < count; index++) {
+        switch (modes[index]) {
+        case SCREENKEY_RENDERER_WAITING_APPROVAL:
+            saw_waiting_approval = true;
+            break;
+        case SCREENKEY_RENDERER_WAITING_INPUT:
+            saw_waiting_input = true;
+            break;
+        case SCREENKEY_RENDERER_ERROR:
+            saw_error = true;
+            break;
+        case SCREENKEY_RENDERER_COMPLETED:
+            saw_completed = true;
+            break;
+        default:
+            /* OFF / AVAILABLE / WORKING_MOVING never need the shared LED, so
+             * they contribute nothing. */
+            break;
+        }
+    }
+
+    if (saw_waiting_approval) {
+        return SCREENKEY_LED_WAITING_APPROVAL;
+    }
+    if (saw_waiting_input) {
+        return SCREENKEY_LED_WAITING_INPUT;
+    }
+    if (saw_error) {
+        return SCREENKEY_LED_ERROR;
+    }
+    /* Ranked last on purpose: completion is a notice, not a request for the
+     * user to act, so it must never hide an approval, input or error state on
+     * another screen. */
+    if (saw_completed) {
+        return SCREENKEY_LED_COMPLETED;
+    }
+    return SCREENKEY_LED_OFF;
+}
+
+uint16_t screenkey_led_period_ms(enum screenkey_led_indication indication) {
+    /* OFF and COMPLETED are both static: neither animates, so a zero tick
+     * period tells the caller to stop rescheduling instead of ticking an
+     * unchanging LED forever. COMPLETED still ends on its own, but that is a
+     * single wake-up at SCREENKEY_COMPLETED_HOLD_MS, which the driver
+     * schedules itself rather than an animation period. */
+    return (indication == SCREENKEY_LED_OFF || indication == SCREENKEY_LED_COMPLETED) ? 0 : 100;
+}
+
+uint8_t screenkey_led_frame_count(enum screenkey_led_indication indication) {
+    switch (indication) {
+    case SCREENKEY_LED_OFF:
+        return 0;
+    case SCREENKEY_LED_WAITING_INPUT:
+        return SCREENKEY_RENDERER_FRAME_COUNT;
+    case SCREENKEY_LED_COMPLETED:
+        /* One frame, not zero: the colour is constant, but the caller folds
+         * its frame counter through this value and must not divide by zero. */
+        return 1;
+    case SCREENKEY_LED_WAITING_APPROVAL:
+    case SCREENKEY_LED_ERROR:
+    default:
+        /* Blink shares the same 2000ms cycle as the breathing wave so every
+         * non-OFF indication satisfies period_ms * frame_count == CYCLE_MS. */
+        return 20;
+    }
+}
+
+struct screenkey_led_color screenkey_led_color_for(enum screenkey_led_indication indication,
+                                                   uint8_t frame) {
+    if (indication == SCREENKEY_LED_OFF) {
+        return (struct screenkey_led_color){0, 0, 0};
+    }
+
+    struct screenkey_led_color base;
+    switch (indication) {
+    case SCREENKEY_LED_WAITING_APPROVAL:
+        base = (struct screenkey_led_color){0xFA, 0xCC, 0x15};
+        break;
+    case SCREENKEY_LED_WAITING_INPUT:
+        base = (struct screenkey_led_color){0xF9, 0x73, 0x16};
+        break;
+    case SCREENKEY_LED_COMPLETED:
+        /* The same green the finished border is drawn in, so the LEDs and the
+         * ScreenKey read as one indication rather than two. */
+        base = (struct screenkey_led_color){0x22, 0xC5, 0x5E};
+        break;
+    case SCREENKEY_LED_ERROR:
+    default:
+        base = (struct screenkey_led_color){0xEF, 0x44, 0x44};
+        break;
+    }
+
+    uint8_t level;
+    if (indication == SCREENKEY_LED_COMPLETED) {
+        /* Steady at the ceiling for the whole hold: completion is reported by
+         * how long the green stays lit, not by any movement in it. */
+        level = SCREENKEY_LED_MAX_LEVEL;
+    } else if (indication == SCREENKEY_LED_WAITING_INPUT) {
+        /* Reuse the same triangle wave the per-screen border breathes with,
+         * just rescaled onto the LED's lower brightness ceiling. */
+        level = scale8(SCREENKEY_LED_MAX_LEVEL, screenkey_renderer_breath_opacity(frame));
+    } else {
+        /* Blink: half the cycle fully on at the 40% ceiling, half fully
+         * dark, folded onto the same 20-frame cycle as the breathing wave. */
+        const uint8_t normalized_frame = frame % SCREENKEY_RENDERER_FRAME_COUNT;
+        level = normalized_frame < (SCREENKEY_RENDERER_FRAME_COUNT / 2) ? SCREENKEY_LED_MAX_LEVEL
+                                                                        : 0;
+    }
+
+    return (struct screenkey_led_color){
+        .r = scale8(base.r, level),
+        .g = scale8(base.g, level),
+        .b = scale8(base.b, level),
+    };
+}

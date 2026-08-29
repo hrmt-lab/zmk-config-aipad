@@ -35,7 +35,7 @@ overlayではすべて`&gpio0` / `&gpio1`の直接参照で統一しています
 | 19 | RE-A | P0.09 | — | エンコーダA（NFC1パッド） |
 | 20 | RE-B | P0.04 | D4 | エンコーダB |
 | 21 | COL2 | P0.10 | — | matrix column 2（NFC2パッド） |
-| 22 | LED | P0.05 | D5 | WS2812B ×4 DIN（未実装、GPIO hogでLow固定） |
+| 22 | LED | P0.05 | D5 | WS2812B-V6 ×4 DIN、`spi3`のSPIM MOSIで駆動 |
 | 24 | COL3 | P1.11 | D6 | matrix column 3 |
 
 ScreenKeyの物理配置は**左からCS-1、CS-2、CS-3、CS-4**（＝slot 0〜3）です。
@@ -56,6 +56,7 @@ ScreenKeyの物理配置は**左からCS-1、CS-2、CS-3、CS-4**（＝slot 0〜
 |---|---|
 | `i2c1`の既定がP0.04／P0.05 = エンコーダBとWS2812Bデータ線 | overlayで`&i2c1`を`disabled` |
 | `spi2`の既定がP1.13／P1.14／P1.15 = CS 3本 | pinctrlでSCKをP1.03、MOSIをP1.12へ張り替え |
+| `spi3`の既定（`spi3_default`）がP0.20／P0.21／P0.24 = QSPIフラッシュと同じピン | 専用の`aipad_spi3_default`でMOSIのみP0.05へ張り替え |
 | `uart0`の既定がP1.11（TX）／P1.12（RX）= COL3とMOSI | `xiao_ble_zmk.dts`が`&xiao_serial`を既に`disabled`にしている。ZMK StudioのRPCは`studio-rpc-usb-uart` snippet経由でUSB CDCを使う |
 | P0.09／P0.10がNFCアンテナパッド | overlayの`&uicr { nfct-pins-as-gpios; };`でGPIO化 |
 | QSPI（P0.20〜P0.25）、電池計測（ADC ch7 = P0.31 / `power-gpios` P0.14） | 競合なし |
@@ -152,10 +153,74 @@ ZMKのEC11ドライバは直交信号の**遷移ごと**に±1を数えるため
 プッシュ付きエンコーダに載せ替えればdevicetreeを変えずに`RC(2,3)`が生きます。
 そのため`matrix-transform`は12ポジションのまま残してあります。
 
-## WS2812B（未実装）
+## WS2812B-V6 ×4 ステータスLED
 
-P0.05にWS2812Bが4個デイジーチェーンで載っていますが、LEDドライバはまだ入れていません。
-**ピンはGPIO hogでLowに固定**してあります。
+P0.05のWS2812B-V6 ×4を`spi3`のSPIM MOSI（MOSI-only、クロック・MISO無し）で駆動します。
+4個は`aipad_leds`（`chain-length = 4`）としてまとめて1本のチェーンになっていて、
+Renderer側（`src/status_led.c` / `src/screenkey_renderer_model.c`）も4個を常に同じ色・
+同じ明滅で書きます。表示の意味は[README.md](../README.md)を参照してください。
+
+### なぜ`spi3`か
+
+このボードで空いているSPI/SPIMペリフェラルは`spi3`だけです。
+
+- `spi2`は4枚のScreenKey（ST7735S）が既に使っている
+- `spi0`・`spi1`はそれぞれ`i2c0`・`i2c1`と排他（nRF52840はSPIMとTWIMでインスタンスを共有する）
+
+`spi3`の board 既定pinctrl（`spi3_default`）はP0.21（SCK）／P0.20（MOSI）／P0.24（MISO）を使い、
+これはQSPIフラッシュ（p25q16h）と同じピンです。そのままではSPI初期化がQSPIより先に
+そのピンを取ってしまうため、専用の`aipad_spi3_default` / `aipad_spi3_sleep`をoverlayへ定義し、
+MOSIだけをP0.05へ張り替えています（WS2812はクロックもMISOも不要）。
+
+### SPIフレームとWS2812B-V6のビットタイミング
+
+`worldsemi,ws2812-spi`は、WS2812の1ビットを1個の8bit SPIフレームへエンコードします。
+`spi-one-frame` / `spi-zero-frame`の先頭から連続するHighビットの長さが、そのままWS2812の
+High区間（T0H / T1H）になります。
+
+```dts
+&spi3 {
+    ...
+    aipad_leds: ws2812@0 {
+        compatible = "worldsemi,ws2812-spi";
+        spi-max-frequency = <8000000>;
+        chain-length = <4>;
+        spi-one-frame  = <0xFC>;
+        spi-zero-frame = <0xC0>;
+        reset-delay = <300>;
+        color-mapping = <LED_COLOR_ID_GREEN LED_COLOR_ID_RED LED_COLOR_ID_BLUE>;
+    };
+};
+```
+
+- `spi-max-frequency = <8000000>`: nRFのSPIMは1/2/4/8/16/32MHzしかロックできず、
+  `get_nrf_spim_frequency()`（`zephyr/drivers/spi/spi_nrfx_spim.c`）は要求値をこの並びへ
+  **黙って切り下げます**。`6400000`のような中間値を書くと4MHzへ落ち、1bit=250nsになって
+  `spi-one-frame = 0xFC`（6bit High）のT1Hが1250nsとなり、WS2812B-V6のT1H規格（580ns〜1µs）を
+  超えます。8MHzなら1bit=125nsで、この切り下げが起きません。
+- `spi-one-frame = <0xFC>`: 8bit中6bit High = 6 × 125ns = **750ns**。V6のT1H規格
+  （580ns〜1µs）の中央付近に収まります。
+- `spi-zero-frame = <0xC0>`: 8bit中2bit High = 2 × 125ns = **250ns**。V6のT0H規格
+  （220〜380ns）に収まります。
+- 副作用として、'1'ビット直後のLow区間（T1L）は250nsになり、V6のT1L規格（580ns〜1µs）を
+  下回ります。ただし0/1の判別に使われるのはT0H/T1Hだけで、T1Lはビットの意味に関与しません。
+  250nsはRES（後述、>280µs）にも遠く及ばないため、問題になりません。SPIMのクロックが離散値
+  しか取れない以上、どの周波数を選んでもT1HとT1Lの両方を同時に規格内へ収めることはできず、
+  ビットの意味を決めるT0H/T1Hの方を優先したのが8MHzという選択です。
+- `reset-delay = <300>`: WS2812B-V6はRES（ラッチ／リセット）に**280µs超**を要求します。
+  このワークスペースの他の構成が使っている70（プレーンなWS2812B向け）はV6には短すぎます。
+- フレーム値を変える場合は**bit 0（LSB）を0のままにしてください**。SPIは転送の合間Lowに
+  アイドルするため、フレームのLSBがLowであることが、そのアイドル電位とWS2812のLowを
+  一致させる条件になっています。
+- `color-mapping`はGRB（WS2812Bのバイト順どおり）。
+
+なお、この基板の電源は3.3Vですが、WS2812B-V6のデータシート（V1.4）ではVDD 3.3〜5.3Vが
+規格内、VIHは0.55×VDDです。3.3V駆動時のVIHは1.82Vとなり、3.3VのDINでも十分マージンが
+あるため、レベルシフタは不要です（V6特性表はVDD=5V条件のため、3.3V駆動では光量が下がります）。
+
+### hogノードは削除しない
+
+`&gpio0`の`ws2812_din_idle` GPIO hogは、`&spi3` / `aipad_leds`が入った後も**残しています**。
 
 ```dts
 &gpio0 {
@@ -167,19 +232,24 @@ P0.05にWS2812Bが4個デイジーチェーンで載っていますが、LEDド�
 };
 ```
 
-放置するとリセット後のP0.05は「切り離された入力」のままなので、1個目のDINが浮いて
-ノイズをデータとして拾い、4個が任意の色（最悪フルホワイト）で点灯し得ます。
-4×60mA = 240mAがXIAOの3.3Vレギュレータを通ると`(5−3.3)×0.24 ≈ 0.4W`が
-レギュレータで熱になります。Lowに固定すればチェーンは静止したidleを見て消灯を保ちます。
+理由は次のとおりです。
 
-hogは`POST_KERNEL 41`で走ります。GPIOドライバ（40）の直後で、他の何かがこのピンに触るより前です。
-`CONFIG_GPIO_HOGS`はdevicetreeにhogノードがあれば自動で`y`になります。
+- `gpio_hogs_init()`（`zephyr/drivers/gpio/gpio_hogs.c`）は`gpio_pin_configure()`を呼ぶだけで、
+  ピンの予約機構を持ちません。そのため後から来る`pinctrl`がP0.05のPIN_CNFを書き換えても
+  衝突エラーにはなりません。
+- 初期化の順序はhog（`POST_KERNEL 41`、GPIOドライバ40の直後）→
+  `AIPAD_ENCODER_PROBE`のピンウォーク（`POST_KERNEL 45`、約8秒間FPCの他の信号ピンを順に
+  駆動する）→ `spi3`のpinctrl（`POST_KERNEL 50`）です。hogが無いと、P0.05はhogとspi3の間の
+  区間、ピンウォークが0.5mmピッチの隣接トレースを叩いている間ずっと「浮いた入力」のままになり、
+  何を拾うか分かりません。hogはこの間ずっとP0.05をLowへ駆動し続けることで、その窓を塞いでいます。
+- `aipad_spi3_sleep`の`low-power-enable`は、spi3がidleになるとP0.05を完全にハイインピーダンスの
+  入力へ戻します。今はCONFIG_PMもCONFIG_ZMK_SLEEPも無効なので実際には使われませんが、
+  将来どちらかを有効にしたときに、その時点で（もう動いていない）SPIのpinctrlではなく
+  このhogがP0.05をLow固定に保つ役目を引き継ぎます。
 
-将来、AI clientの状態に応じて色を変える用途に使う予定です。実装する際は:
-
-- 状態→色の写像は`src/screenkey_renderer_model.c`側へ純関数として足すと、
-  `tools/test-renderer-model.sh`でホスト側テストできる
-- **`ws2812_din_idle`のhogノードを削除する**こと。残したままだとhogがピンを保持してLEDドライバと衝突する
+`CONFIG_AIPAD_STATUS_LED=n`にしてもこのdevicetree自体（`&spi3` / `aipad_leds` / hog）は
+そのまま残ります。Kconfigが切るのはRenderer側のロジック（`status_led.c`のコンパイル）だけで、
+SPIMのpinctrlはP0.05を引き続きLowで保持するため、チェーンは浮くことなく消灯を保ちます。
 
 ## 電池
 

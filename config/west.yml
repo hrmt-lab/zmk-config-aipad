@@ -16,6 +16,6 @@ manifest:
       revision: custom/raw-hid-custom
     - name: zmk-rawhid-app
       remote: hrmt-lab
-      revision: develop
+      revision: main
   self:
     path: config

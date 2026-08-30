@@ -373,33 +373,70 @@
 
 /* WS2812B-V6 timing, driven over spi3 with no clock/MISO wired (MOSI-only,
  * "spi-cs-less" style): each WS2812 bit is encoded as one 8-bit SPI frame at
- * spi-max-frequency, where spi-one-frame / spi-zero-frame's count of leading
- * high bits stands in for the WS2812's high pulse width.
+ * spi-max-frequency, shifted out MSB first. The run of high bits inside the
+ * frame becomes the WS2812's high pulse (T0H / T1H) and everything low
+ * around it - the frame's own trailing zeros plus the leading zeros of the
+ * frame that follows - becomes the low pulse (T0L / T1L). Count the bits,
+ * do not assume the high run starts at bit 7: 0x70 and 0x40 below both
+ * begin with a low bit.
  *
- * spi-max-frequency = <8000000>: the nRF SPIM only locks to 1/2/4/8/16/32
+ * spi-max-frequency = <4000000>: the nRF SPIM only locks to 1/2/4/8/16/32
  * MHz. get_nrf_spim_frequency() (zephyr/drivers/spi/spi_nrfx_spim.c:165)
- * rounds a requested rate DOWN to the nearest one of those, silently.
- * Asking for 6400000 would become 4 MHz, where one SPI bit is 250ns and
- * spi-one-frame's 6 high bits (0xFC) would give a 1250ns T1H - over the
- * WS2812B-V6's 1000ns ceiling. At 8 MHz one SPI bit is 125ns instead.
+ * rounds a requested rate DOWN to the nearest one of those, silently, so
+ * asking for anything between 4 and 8 MHz still lands on 4 MHz. At 4 MHz one
+ * SPI bit is 250ns.
  *
- * spi-one-frame = <0xFC>: 6 of 8 bits high, i.e. 6 * 125ns = 750ns high.
- * That sits mid-way inside the V6's T1H spec of 580ns-1us.
+ * spi-one-frame = <0x70> is 0111_0000: one low bit, then 3 high, then 4
+ * low. T1H = 3 * 250ns = 750ns. T1L = the frame's own 4 trailing low bits
+ * plus the 1 leading low bit of the next frame = 5 * 250ns = 1250ns. Both
+ * sit inside the WS2812B-V6's spec: T1H 580-1000ns, T1L 580-1600ns.
  *
- * spi-zero-frame = <0xC0>: 2 of 8 bits high, i.e. 2 * 125ns = 250ns high.
- * That is inside the V6's T0H spec of 220-380ns.
+ * spi-zero-frame = <0x40> is 0100_0000: one low bit, one high, then 6 low.
+ * T0H = 250ns, inside the V6's 220-380ns spec. T0L = 6 + 1 = 7 * 250ns =
+ * 1750ns, over the V6's nominal 1600ns ceiling - see the asymmetry
+ * argument below for why the long side is the harmless one.
  *
- * The resulting T1L (low time after a '1' bit) is 250ns, under the V6's
- * nominal 580ns-1us T1L. That is fine: T1L is not one of the parameters
- * WS2812B-V6 uses to tell a 0 bit from a 1 bit (only T0H/T1H are), and
- * 250ns is nowhere near the ~280us RES/latch threshold either. Because the
- * SPIM clock only takes discrete values, no single frequency puts both T1H
- * and T1L inside spec at once - 8 MHz is the choice that keeps the
- * bit-defining edges (T0H/T1H) correct.
+ * This board used to run spi-max-frequency = <8000000> with spi-one-frame =
+ * <0xFC> / spi-zero-frame = <0xC0> (125ns/bit, T1H=750ns, T0H=250ns - both
+ * nominally in spec). That configuration shipped with a real bug: T1L came
+ * out to 250ns, well under the V6's 580ns floor. WS2812's decoder is
+ * edge-triggered - it starts a one-shot on the rising edge of DIN and
+ * samples it against T0H/T1H, then waits for the *next* rising edge to
+ * start the following bit - so a low period this short does not leave room
+ * for the line to settle low before the next bit's edge arrives. Back-to-back
+ * '1' bits then merge into what the decoder reads as one longer high pulse,
+ * so bits are lost. Each LED re-emits what it decoded to the next one down
+ * the chain, so the damage accumulates: on real hardware the four LEDs came
+ * out as unrelated garbled colours that changed on every refresh, because
+ * which bits get merged depends on the bit pattern of that particular frame.
+ *
+ * No 8 MHz frame value could have fixed this. At 8 MHz a whole 8-bit frame
+ * is 1000ns, while the V6 needs T1H >= 580ns and T1L >= 580ns, i.e. at least
+ * 1160ns for a '1' bit - more than one frame can carry. 4 MHz gives 2000ns
+ * per frame, which fits both with room to spare.
+ *
+ * The trade-off going the other way is harmless: at 4 MHz the total bit
+ * period (T0H+T0L or T1H+T1L) is 2000ns, over the V6's nominal 1250ns +-
+ * 600ns period, but that only matters if it starts to approach the ~280us
+ * RES/latch threshold below - and 2000ns is nowhere close. A long low is
+ * just an idle line to the receiving LED; a short low is a lost bit
+ * boundary. That asymmetry is why the correct fix is to lengthen T1L, not
+ * to look for some frequency that shortens T1H instead.
+ *
+ * This also doubles the SPI transfer's tolerance for byte-to-byte gaps
+ * versus 8 MHz: EasyDMA has to keep feeding a byte every bit period or the
+ * line droops early, and spi3 shares RAM/AHB bandwidth with spi2's much
+ * larger ST7735 framebuffer transfers on this board. Twice the time budget
+ * per byte makes that contention less likely to show up as further
+ * corruption on top of the T1L problem above.
  *
  * If either frame value is ever changed, keep bit 0 (the LSB) clear: SPI
  * idles low between transfers, and a frame with a low LSB is what makes
  * that idle level line up with a WS2812 low.
+ *
+ * These are the same values already proven on this workspace's hitsuki46
+ * board (hitsuki46.dtsi, the &spi1 / ws2812 node): 4 MHz, spi-one-frame =
+ * <0x70>, spi-zero-frame = <0x40>.
  *
  * reset-delay = <300>: WS2812B-V6 requires RES (latch/reset) > 280us
  * between frames. 70, used for the plain WS2812B elsewhere in this
@@ -416,10 +453,10 @@
     aipad_leds: ws2812@0 {
         compatible = "worldsemi,ws2812-spi";
         reg = <0>;
-        spi-max-frequency = <8000000>;
+        spi-max-frequency = <4000000>;
         chain-length = <4>;
-        spi-one-frame  = <0xFC>;
-        spi-zero-frame = <0xC0>;
+        spi-one-frame  = <0x70>;
+        spi-zero-frame = <0x40>;
         reset-delay = <300>;
         color-mapping = <LED_COLOR_ID_GREEN LED_COLOR_ID_RED LED_COLOR_ID_BLUE>;
     };

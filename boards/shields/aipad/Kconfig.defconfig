@@ -61,4 +61,27 @@ config AIPAD_STATUS_LED_SELFTEST
       without also waiting through the 12 second backlight beacon and the
       8 second pin walk.
 
+config AIPAD_STATUS_LED_CHAIN_PROBE
+    bool "Cycle diagnostic frames on the WS2812B status indicator forever"
+    default n
+    depends on AIPAD_STATUS_LED && !AIPAD_STATUS_LED_SELFTEST
+    help
+      Bring-up aid for a WS2812B-V6 chain where only the first pixel out of
+      four ever lights correctly. Unlike AIPAD_STATUS_LED_SELFTEST, which
+      runs once at boot for a few seconds, this repeats ten fixed frames
+      forever, two seconds each, rewriting the same frame every 500 ms
+      (bypassing the usual "skip if unchanged" shortcut, so a stuck pixel
+      cannot hide behind it): all red, all green, all blue, all white, a
+      single white pixel walking positions 0..3, one distinct colour per
+      pixel, then all off. Frames that light all four pixels at once use
+      half brightness (128), since VCC_3V3 feeds both the MCU and the
+      chain; the single-pixel walk frames use full brightness (255), since
+      one lit pixel only draws about 20 mA. A LOG_INF line names the phase
+      and reports write_count and last_write_err each time a phase starts,
+      and because the loop never ends every phase is guaranteed to reach
+      the USB CDC log eventually even though that backend is not up until
+      roughly 20 seconds after boot. See docs/bring-up.md for how to read
+      the ten phases. Disabled whenever AIPAD_STATUS_LED_SELFTEST is on:
+      both diagnostics drive the same strip and would fight over it.
+
 endif

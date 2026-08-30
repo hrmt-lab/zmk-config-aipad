@@ -219,9 +219,17 @@ struct screenkey_led_color screenkey_led_color_for(enum screenkey_led_indication
         base = (struct screenkey_led_color){0xF9, 0x73, 0x16};
         break;
     case SCREENKEY_LED_COMPLETED:
-        /* The same green the finished border is drawn in, so the LEDs and the
-         * ScreenKey read as one indication rather than two. */
-        base = (struct screenkey_led_color){0x22, 0xC5, 0x5E};
+        /* A pure green, deliberately NOT the 0x22C55E the finished border is
+         * drawn in. Feeding a screen colour straight to the chain does not
+         * reproduce it: the panel applies an sRGB transfer curve, while a
+         * WS2812 channel is linear PWM, so 0x22C55E's blue (0x5E, 48% of its
+         * green) lands far brighter on the LED than it looks on the panel and
+         * turns the green visibly cyan. The green channel keeps the same
+         * 0xC5 it had, so only the cast changes, not the brightness. The
+         * border in status_screen.c still uses 0x22C55E - matching the two by
+         * eye is what makes them read as one indication, not matching their
+         * hex. */
+        base = (struct screenkey_led_color){0x00, 0xC5, 0x00};
         break;
     case SCREENKEY_LED_ERROR:
     default:

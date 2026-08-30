@@ -279,7 +279,10 @@ static void test_led_completed_shape(void) {
 
     assert(lit.g > lit.r);
     assert(lit.g > lit.b);
-    assert(lit.r > 0 && lit.b > 0);
+    /* Pure green: red and blue are both off. See the comment on the
+     * SCREENKEY_LED_COMPLETED case in screenkey_led_color_for() for why the
+     * chain must not simply reuse the border's 0x22C55E. */
+    assert(lit.r == 0 && lit.b == 0);
 
     for (uint8_t frame = 0; frame <= 40; frame++) {
         const struct screenkey_led_color color =
@@ -289,11 +292,10 @@ static void test_led_completed_shape(void) {
         assert(color.b == lit.b);
     }
 
-    /* The border is drawn in 0x22C55E, so the chain must be that same green
-     * scaled onto the LED brightness ceiling - not a different green. */
-    assert(lit.r == (uint8_t)((0x22 * SCREENKEY_LED_MAX_LEVEL) / 255));
+    /* The green channel still carries the border green's 0xC5, scaled onto
+     * the LED brightness ceiling, so the completion stays as bright as it
+     * was; only the red and blue that made it read cyan are gone. */
     assert(lit.g == (uint8_t)((0xC5 * SCREENKEY_LED_MAX_LEVEL) / 255));
-    assert(lit.b == (uint8_t)((0x5E * SCREENKEY_LED_MAX_LEVEL) / 255));
 
     /* Static, so no animation period; one frame, so the caller's frame
      * counter folds without dividing by zero. */

@@ -65,7 +65,7 @@ DEVICE_HELLOで`CAP_AI_CLIENT_CLAUDE_CODE`（bit 12）を広告する。
 | `WAITING_APPROVAL` | 黄`#FACC15`の点滅枠 |
 | `WAITING_INPUT` | オレンジ`#F97316`の呼吸枠 |
 | `AVAILABLE` | ロゴ表示、枠なし |
-| `COMPLETED` | 既存の緑枠を15秒表示。共有LEDも同じ緑`#22C55E`を同じ15秒だけ点灯 |
+| `COMPLETED` | 既存の緑枠（`#22C55E`）を15秒表示。共有LEDは同じ15秒だけ純緑`(0, 0xC5, 0)`で点灯（枠と同じ数値ではない。理由は[hardware.md](hardware.md)参照） |
 | `ERROR` | 既存の赤点滅枠 |
 | sessionなし／`NONE`／未知activity | 画面とbacklightをOFF |
 

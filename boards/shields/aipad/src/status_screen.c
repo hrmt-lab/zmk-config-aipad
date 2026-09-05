@@ -12,6 +12,7 @@
 
 #include <rawhid_app/ai_client_state.h>
 #include <rawhid_app/events/ai_client_state_changed.h>
+#include <rawhid_app/packet.h>
 #include <zmk/display.h>
 #include <zmk/event_manager.h>
 
@@ -24,9 +25,17 @@ LOG_MODULE_REGISTER(screenkey_renderer, CONFIG_ZMK_LOG_LEVEL);
 
 #define BACKLIGHT_NODE DT_NODELABEL(aipad_backlight)
 #define BORDER_OBJECT_COUNT 4
+#define HUD_CORNER_OBJECT_COUNT 8
+#define SENT_CHECK_SEGMENT_COUNT 2
 #define ANIMATION_PERIOD_MS 100
 #define BLINK_PERIOD_MS 1000
 #define PANEL_SIZE 128
+#define HUD_CORNER_THICKNESS 6
+#define HUD_CORNER_LENGTH 28
+#define HUD_BACKGROUND_OPACITY 38 /* 15% of 255 */
+#define SENT_RING_DURATION_MS 250
+#define SENT_CHECK_DURATION_MS 150
+#define SENT_FEEDBACK_HOLD_MS 600
 
 /* Partial render buffer for each screen this file drives. Screen 0 keeps using
  * the buffer Zephyr's LVGL glue allocates for chosen zephyr,display. Sixteen
@@ -38,23 +47,30 @@ LOG_MODULE_REGISTER(screenkey_renderer, CONFIG_ZMK_LOG_LEVEL);
 
 /* Everything that used to be a single set of file statics is now per physical
  * ScreenKey, so every slot animates and clears completely independently. */
-struct screenkey_screen {
-    bool backlight_requested;
-    lv_obj_t *logo;
-    lv_obj_t *full_border[BORDER_OBJECT_COUNT];
-    lv_obj_t *working_segments[SCREENKEY_RENDERER_MAX_SEGMENTS];
-    lv_timer_t *state_timer;
-    enum screenkey_renderer_mode current_mode;
-    uint8_t animation_frame;
-    bool blink_visible;
-    uint32_t display_generation;
-    uint32_t timer_generation;
-};
-
 struct screenkey_event_state {
     struct rawhid_app_ai_client_state state;
     uint32_t state_generation;
     enum rawhid_app_ai_client_state_event_reason reason;
+};
+
+struct screenkey_screen {
+    bool backlight_requested;
+    lv_obj_t *logo;
+    lv_obj_t *full_border[BORDER_OBJECT_COUNT];
+    lv_obj_t *hud_background;
+    lv_obj_t *hud_corners[HUD_CORNER_OBJECT_COUNT];
+    lv_obj_t *working_segments[SCREENKEY_RENDERER_MAX_SEGMENTS];
+    lv_obj_t *sent_arc;
+    lv_obj_t *sent_check[SENT_CHECK_SEGMENT_COUNT];
+    lv_point_precise_t sent_check_points[SENT_CHECK_SEGMENT_COUNT][2];
+    lv_timer_t *state_timer;
+    enum screenkey_renderer_mode current_mode;
+    uint8_t animation_frame;
+    bool blink_visible;
+    bool sent_feedback_active;
+    struct screenkey_event_state sent_resume_event;
+    uint32_t display_generation;
+    uint32_t timer_generation;
 };
 
 /* SCREENKEY_RENDERER_OFF is the first enumerator, so the implicit zero
@@ -416,6 +432,114 @@ static void hide_working_segments(struct screenkey_screen *screen) {
     }
 }
 
+static void hide_hud_target(struct screenkey_screen *screen) {
+    set_hidden(screen->hud_background, true);
+    for (size_t index = 0; index < HUD_CORNER_OBJECT_COUNT; index++) {
+        set_hidden(screen->hud_corners[index], true);
+    }
+}
+
+static void show_hud_target(struct screenkey_screen *screen) {
+    const lv_color_t yellow = lv_color_hex(0xFACC15);
+
+    set_object_color_and_opacity(screen->hud_background, yellow, HUD_BACKGROUND_OPACITY);
+    set_hidden(screen->hud_background, false);
+    for (size_t index = 0; index < HUD_CORNER_OBJECT_COUNT; index++) {
+        set_object_color(screen->hud_corners[index], yellow);
+        set_hidden(screen->hud_corners[index], false);
+    }
+}
+
+static void hide_sent_feedback(struct screenkey_screen *screen) {
+    lv_anim_delete(screen, NULL);
+    set_hidden(screen->sent_arc, true);
+    for (size_t index = 0; index < SENT_CHECK_SEGMENT_COUNT; index++) {
+        set_hidden(screen->sent_check[index], true);
+    }
+}
+
+static void sent_arc_anim_cb(void *var, int32_t value) {
+    struct screenkey_screen *screen = (struct screenkey_screen *)var;
+    lv_arc_set_end_angle(screen->sent_arc, value);
+}
+
+static void sent_check_first_anim_cb(void *var, int32_t value) {
+    struct screenkey_screen *screen = (struct screenkey_screen *)var;
+    const int32_t start_x = 35;
+    const int32_t start_y = 69;
+    const int32_t end_x = 58;
+    const int32_t end_y = 90;
+
+    screen->sent_check_points[0][1].x = start_x + ((end_x - start_x) * value) / 100;
+    screen->sent_check_points[0][1].y = start_y + ((end_y - start_y) * value) / 100;
+    lv_line_set_points(screen->sent_check[0], screen->sent_check_points[0], 2);
+}
+
+static void sent_check_second_anim_cb(void *var, int32_t value) {
+    struct screenkey_screen *screen = (struct screenkey_screen *)var;
+    const int32_t start_x = 58;
+    const int32_t start_y = 90;
+    const int32_t end_x = 96;
+    const int32_t end_y = 43;
+
+    screen->sent_check_points[1][1].x = start_x + ((end_x - start_x) * value) / 100;
+    screen->sent_check_points[1][1].y = start_y + ((end_y - start_y) * value) / 100;
+    lv_line_set_points(screen->sent_check[1], screen->sent_check_points[1], 2);
+}
+
+static void start_sent_check_second_segment(struct screenkey_screen *screen) {
+    set_hidden(screen->sent_check[1], false);
+
+    lv_anim_t animation;
+    lv_anim_init(&animation);
+    lv_anim_set_var(&animation, screen);
+    lv_anim_set_values(&animation, 0, 100);
+    lv_anim_set_duration(&animation, SENT_CHECK_DURATION_MS / 2);
+    lv_anim_set_exec_cb(&animation, sent_check_second_anim_cb);
+    lv_anim_start(&animation);
+}
+
+static void sent_check_first_completed_cb(lv_anim_t *animation) {
+    start_sent_check_second_segment((struct screenkey_screen *)animation->var);
+}
+
+static void sent_arc_completed_cb(lv_anim_t *animation) {
+    struct screenkey_screen *screen = (struct screenkey_screen *)animation->var;
+
+    set_hidden(screen->sent_check[0], false);
+    lv_anim_t check_animation;
+    lv_anim_init(&check_animation);
+    lv_anim_set_var(&check_animation, screen);
+    lv_anim_set_values(&check_animation, 0, 100);
+    lv_anim_set_duration(&check_animation, SENT_CHECK_DURATION_MS / 2);
+    lv_anim_set_exec_cb(&check_animation, sent_check_first_anim_cb);
+    lv_anim_set_completed_cb(&check_animation, sent_check_first_completed_cb);
+    lv_anim_start(&check_animation);
+}
+
+static void show_sent_feedback(struct screenkey_screen *screen) {
+    const lv_color_t green = lv_color_hex(0x22C55E);
+
+    lv_arc_set_end_angle(screen->sent_arc, 0);
+    lv_obj_set_style_arc_color(screen->sent_arc, green, LV_PART_INDICATOR);
+    set_hidden(screen->sent_arc, false);
+    screen->sent_check_points[0][0] = (lv_point_precise_t){35, 69};
+    screen->sent_check_points[0][1] = screen->sent_check_points[0][0];
+    screen->sent_check_points[1][0] = (lv_point_precise_t){58, 90};
+    screen->sent_check_points[1][1] = screen->sent_check_points[1][0];
+    lv_line_set_points(screen->sent_check[0], screen->sent_check_points[0], 2);
+    lv_line_set_points(screen->sent_check[1], screen->sent_check_points[1], 2);
+
+    lv_anim_t animation;
+    lv_anim_init(&animation);
+    lv_anim_set_var(&animation, screen);
+    lv_anim_set_values(&animation, 0, 360);
+    lv_anim_set_duration(&animation, SENT_RING_DURATION_MS);
+    lv_anim_set_exec_cb(&animation, sent_arc_anim_cb);
+    lv_anim_set_completed_cb(&animation, sent_arc_completed_cb);
+    lv_anim_start(&animation);
+}
+
 static void render_working_frame(struct screenkey_screen *screen) {
     struct screenkey_renderer_segment segments[SCREENKEY_RENDERER_MAX_SEGMENTS] = {0};
     const size_t count = screenkey_renderer_working_segments(screen->animation_frame, segments);
@@ -438,10 +562,20 @@ static void stop_state_timer(struct screenkey_screen *screen) {
     }
 }
 
+static void screenkey_render(struct screenkey_screen *screen, uint8_t display_slot,
+                             struct screenkey_event_state event);
+
 static void state_timer_cb(lv_timer_t *timer) {
     struct screenkey_screen *screen = (struct screenkey_screen *)lv_timer_get_user_data(timer);
 
     if (screen->timer_generation != screen->display_generation) {
+        return;
+    }
+
+    if (screen->sent_feedback_active) {
+        screen->sent_feedback_active = false;
+        screen->state_timer = NULL;
+        screenkey_render(screen, (uint8_t)(screen - screens), screen->sent_resume_event);
         return;
     }
 
@@ -492,6 +626,24 @@ static void screenkey_render(struct screenkey_screen *screen, uint8_t display_sl
     stop_state_timer(screen);
     hide_full_border(screen);
     hide_working_segments(screen);
+    hide_hud_target(screen);
+    hide_sent_feedback(screen);
+    screen->sent_feedback_active = false;
+
+    if (event.state.screenkey_state == RAWHID_APP_AI_CLIENT_SCREENKEY_STATE_SENT) {
+        screen->sent_resume_event = event;
+        screen->sent_resume_event.state.screenkey_state =
+            RAWHID_APP_AI_CLIENT_SCREENKEY_STATE_NORMAL;
+        screen->sent_feedback_active = true;
+        set_logo_for_client_type(screen, event.state.client_type);
+        set_hidden(screen->logo, false);
+        set_backlight(screen, true);
+        show_sent_feedback(screen);
+        start_timer(screen, SENT_FEEDBACK_HOLD_MS, true);
+        LOG_INF("ScreenKey AI client sent feedback: slot=%u revision=%u generation=%u",
+                display_slot, event.state.revision, event.state_generation);
+        return;
+    }
 
     if (screen->current_mode == SCREENKEY_RENDERER_OFF) {
 #if IS_ENABLED(CONFIG_AIPAD_DISPLAY_SELFTEST)
@@ -526,9 +678,13 @@ static void screenkey_render(struct screenkey_screen *screen, uint8_t display_sl
         start_timer(screen, ANIMATION_PERIOD_MS, false);
         break;
     case SCREENKEY_RENDERER_WAITING_APPROVAL:
-        screen->blink_visible = true;
-        show_full_border(screen, lv_color_hex(0xFACC15), true);
-        start_timer(screen, BLINK_PERIOD_MS, false);
+        if (event.state.screenkey_state == RAWHID_APP_AI_CLIENT_SCREENKEY_STATE_HUD_TARGET) {
+            show_hud_target(screen);
+        } else {
+            screen->blink_visible = true;
+            show_full_border(screen, lv_color_hex(0xFACC15), true);
+            start_timer(screen, BLINK_PERIOD_MS, false);
+        }
         break;
     case SCREENKEY_RENDERER_WAITING_INPUT:
         screen->animation_frame = 0;
@@ -638,6 +794,11 @@ static lv_obj_t *build_screen(struct screenkey_screen *screen) {
     lv_obj_set_style_radius(root, 0, LV_PART_MAIN);
     lv_obj_clear_flag(root, LV_OBJ_FLAG_SCROLLABLE);
 
+    screen->hud_background = create_rect(root);
+    lv_obj_set_pos(screen->hud_background, 0, 0);
+    lv_obj_set_size(screen->hud_background, PANEL_SIZE, PANEL_SIZE);
+    hide_hud_target(screen);
+
     screen->logo = lv_image_create(root);
     lv_image_set_src(screen->logo, &screenkey_codex_logo);
     lv_obj_center(screen->logo);
@@ -660,6 +821,51 @@ static lv_obj_t *build_screen(struct screenkey_screen *screen) {
         screen->working_segments[index] = create_rect(root);
     }
     hide_working_segments(screen);
+
+    for (size_t index = 0; index < HUD_CORNER_OBJECT_COUNT; index++) {
+        screen->hud_corners[index] = create_rect(root);
+    }
+    lv_obj_set_pos(screen->hud_corners[0], 4, 4);
+    lv_obj_set_size(screen->hud_corners[0], HUD_CORNER_LENGTH, HUD_CORNER_THICKNESS);
+    lv_obj_set_pos(screen->hud_corners[1], 4, 4);
+    lv_obj_set_size(screen->hud_corners[1], HUD_CORNER_THICKNESS, HUD_CORNER_LENGTH);
+    lv_obj_set_pos(screen->hud_corners[2], PANEL_SIZE - 4 - HUD_CORNER_LENGTH, 4);
+    lv_obj_set_size(screen->hud_corners[2], HUD_CORNER_LENGTH, HUD_CORNER_THICKNESS);
+    lv_obj_set_pos(screen->hud_corners[3], PANEL_SIZE - 4 - HUD_CORNER_THICKNESS, 4);
+    lv_obj_set_size(screen->hud_corners[3], HUD_CORNER_THICKNESS, HUD_CORNER_LENGTH);
+    lv_obj_set_pos(screen->hud_corners[4], 4, PANEL_SIZE - 4 - HUD_CORNER_THICKNESS);
+    lv_obj_set_size(screen->hud_corners[4], HUD_CORNER_LENGTH, HUD_CORNER_THICKNESS);
+    lv_obj_set_pos(screen->hud_corners[5], 4, PANEL_SIZE - 4 - HUD_CORNER_LENGTH);
+    lv_obj_set_size(screen->hud_corners[5], HUD_CORNER_THICKNESS, HUD_CORNER_LENGTH);
+    lv_obj_set_pos(screen->hud_corners[6], PANEL_SIZE - 4 - HUD_CORNER_LENGTH,
+                   PANEL_SIZE - 4 - HUD_CORNER_THICKNESS);
+    lv_obj_set_size(screen->hud_corners[6], HUD_CORNER_LENGTH, HUD_CORNER_THICKNESS);
+    lv_obj_set_pos(screen->hud_corners[7], PANEL_SIZE - 4 - HUD_CORNER_THICKNESS,
+                   PANEL_SIZE - 4 - HUD_CORNER_LENGTH);
+    lv_obj_set_size(screen->hud_corners[7], HUD_CORNER_THICKNESS, HUD_CORNER_LENGTH);
+    hide_hud_target(screen);
+
+    screen->sent_arc = lv_arc_create(root);
+    lv_obj_set_size(screen->sent_arc, 104, 104);
+    lv_obj_center(screen->sent_arc);
+    lv_arc_set_rotation(screen->sent_arc, 270);
+    lv_arc_set_bg_angles(screen->sent_arc, 0, 360);
+    lv_arc_set_end_angle(screen->sent_arc, 0);
+    lv_obj_set_style_arc_width(screen->sent_arc, 6, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_rounded(screen->sent_arc, true, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_opa(screen->sent_arc, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(screen->sent_arc, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_clear_flag(screen->sent_arc, LV_OBJ_FLAG_CLICKABLE);
+    set_hidden(screen->sent_arc, true);
+
+    for (size_t index = 0; index < SENT_CHECK_SEGMENT_COUNT; index++) {
+        screen->sent_check[index] = lv_line_create(root);
+        lv_obj_set_style_line_color(screen->sent_check[index], lv_color_hex(0x22C55E),
+                                    LV_PART_MAIN);
+        lv_obj_set_style_line_width(screen->sent_check[index], 7, LV_PART_MAIN);
+        lv_obj_set_style_line_rounded(screen->sent_check[index], true, LV_PART_MAIN);
+        set_hidden(screen->sent_check[index], true);
+    }
 
     set_backlight(screen, false);
     return root;
